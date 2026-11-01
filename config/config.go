@@ -46,8 +46,76 @@ type App struct {
 	// TLS is the application TLS configuration
 	TLS `yaml:"tls"`
 
+	// ProduceBudget bounds the produce payload bytes held by the process on
+	// behalf of not-yet-acknowledged produce requests.
+	ProduceBudget ProduceBudgetCfg `yaml:"produce_budget"`
+
 	// Logging config
 	Logging []LoggerCfg
+}
+
+// ProduceBudgetCfg configures byte-weighted admission control shared by all
+// configured clusters.
+type ProduceBudgetCfg struct {
+	// Total number of payload bytes (after applying the duplication factor)
+	// that the process is allowed to hold for produce requests across all
+	// clusters. Covers payload retained in request handlers, dispatcher
+	// channels and sarama in-flight state until a final broker acknowledgement
+	// or terminal failure is received.
+	TotalBytes int64 `yaml:"total_bytes"`
+
+	// Default per-cluster byte budget. A cluster whose producer configuration
+	// does not set `budget_bytes` gets this limit. It prevents one unavailable
+	// cluster from exhausting the admission quota of the others.
+	PerClusterBytes int64 `yaml:"per_cluster_bytes"`
+
+	// DuplicationFactor is applied to every accounted payload (key + value +
+	// decoded headers + record framing) because the same bytes are retained
+	// concurrently at several pipeline stages (handler, dispatcher and
+	// sarama). Allowed values are 1-8.
+	DuplicationFactor int `yaml:"duplication_factor"`
+
+	// MaxConcurrentRequests bounds how many produce requests may be parsed
+	// and staged before having acquired a formal byte reservation, so that
+	// decoded payloads cannot pile up without any limit either.
+	MaxConcurrentRequests int `yaml:"max_concurrent_requests"`
+}
+
+// Default produce budget values.
+const (
+	defaultProduceBudgetTotal       = 128 * 1024 * 1024 // 128 MiB
+	defaultProduceBudgetPerCluster  = 64 * 1024 * 1024  // 64 MiB
+	defaultProduceBudgetDupFactor   = 2
+	defaultProduceBudgetMaxRequests = 512
+)
+
+// ProduceBudgetNormalized fills unset (zero) budget fields with defaults. It
+// is used both by configuration parsing and by code paths that construct
+// configs programmatically without going through FromYAML.
+func (a *App) ProduceBudgetNormalized() ProduceBudgetCfg {
+	b := a.ProduceBudget
+	if b.TotalBytes <= 0 {
+		b.TotalBytes = defaultProduceBudgetTotal
+	}
+	if b.PerClusterBytes <= 0 {
+		b.PerClusterBytes = defaultProduceBudgetPerCluster
+	}
+	if b.DuplicationFactor <= 0 {
+		b.DuplicationFactor = defaultProduceBudgetDupFactor
+	}
+	if b.MaxConcurrentRequests <= 0 {
+		b.MaxConcurrentRequests = defaultProduceBudgetMaxRequests
+	}
+	return b
+}
+
+// ClusterBudgetBytes returns the configured per-cluster byte budget or, when
+// the cluster does not override it, the default per-cluster budget.
+func (a *App) ClusterBudgetBytes(cluster string, p *Proxy) int64 {
+	if p != nil && p.Producer.BudgetBytes > 0 {
+		return p.Producer.BudgetBytes
+	}
+	return a.ProduceBudgetNormalized().PerClusterBytes
 }
 
 // LoggerCfg represents a configuration of an individual logger.
@@ -166,6 +234,13 @@ type Proxy struct {
 
 		// Size of maximum message in bytes
 		MaxMessageBytes int `yaml:"max_message_bytes"`
+
+		// Per-cluster byte budget for produce payload held by the process
+		// (key + value + decoded headers + record framing, multiplied by the
+		// duplication factor). If zero then the application-wide default
+		// `produce_budget.per_cluster_bytes` is used. The value must be large
+		// enough to admit a single maximum-sized message.
+		BudgetBytes int64 `yaml:"budget_bytes"`
 
 		// The type of compression to use on messages.
 		Compression Compression `yaml:"compression"`
@@ -536,9 +611,35 @@ func (a *App) validate() error {
 	if len(a.Proxies) == 0 {
 		return errors.New("at least on proxy must be configured")
 	}
+	budgetCfg := a.ProduceBudgetNormalized()
+	switch {
+	case budgetCfg.TotalBytes <= 0:
+		return errors.New("produce_budget.total_bytes must be > 0")
+	case budgetCfg.PerClusterBytes <= 0:
+		return errors.New("produce_budget.per_cluster_bytes must be > 0")
+	case budgetCfg.PerClusterBytes > budgetCfg.TotalBytes:
+		return errors.New("produce_budget.per_cluster_bytes must be <= produce_budget.total_bytes")
+	case budgetCfg.DuplicationFactor < 1 || budgetCfg.DuplicationFactor > 8:
+		return errors.New("produce_budget.duplication_factor must be in [1, 8]")
+	case budgetCfg.MaxConcurrentRequests <= 0:
+		return errors.New("produce_budget.max_concurrent_requests must be > 0")
+	}
 	for cluster, proxyCfg := range a.Proxies {
 		if err := proxyCfg.validate(); err != nil {
 			return errors.Wrapf(err, "invalid config, cluster=%s", cluster)
+		}
+		// A single maximum-sized record (accounted with the duplication
+		// factor and record framing) must fit both into the cluster limit and
+		// the global one, otherwise every large request would be rejected.
+		minLimit := int64(proxyCfg.Producer.MaxMessageBytes) * int64(budgetCfg.DuplicationFactor)
+		clusterLimit := a.ClusterBudgetBytes(cluster, proxyCfg)
+		if clusterLimit < minLimit {
+			return errors.Errorf("produce byte budget for cluster=%s must be >= producer.max_message_bytes*duplication_factor (%d), got %d",
+				cluster, minLimit, clusterLimit)
+		}
+		if clusterLimit > budgetCfg.TotalBytes {
+			return errors.Errorf("produce byte budget for cluster=%s (%d) must be <= produce_budget.total_bytes (%d)",
+				cluster, clusterLimit, budgetCfg.TotalBytes)
 		}
 	}
 	return nil
@@ -635,6 +736,12 @@ func newApp() *App {
 	appCfg.GRPCAddr = "0.0.0.0:19091"
 	appCfg.TCPAddr = "0.0.0.0:19092"
 	appCfg.Proxies = make(map[string]*Proxy)
+	appCfg.ProduceBudget = ProduceBudgetCfg{
+		TotalBytes:            defaultProduceBudgetTotal,
+		PerClusterBytes:       defaultProduceBudgetPerCluster,
+		DuplicationFactor:     defaultProduceBudgetDupFactor,
+		MaxConcurrentRequests: defaultProduceBudgetMaxRequests,
+	}
 	return appCfg
 }
 

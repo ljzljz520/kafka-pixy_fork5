@@ -114,11 +114,11 @@ func (s *ProducerSuite) TestAsyncProduce(c *C) {
 
 	// When
 	for i := 0; i < 10; i++ {
-		p.AsyncProduce("test.4", sarama.StringEncoder("1"), sarama.StringEncoder(strconv.Itoa(i)), nil)
-		p.AsyncProduce("test.4", sarama.StringEncoder("2"), sarama.StringEncoder(strconv.Itoa(i)), nil)
-		p.AsyncProduce("test.4", sarama.StringEncoder("3"), sarama.StringEncoder(strconv.Itoa(i)), nil)
-		p.AsyncProduce("test.4", sarama.StringEncoder("4"), sarama.StringEncoder(strconv.Itoa(i)), nil)
-		p.AsyncProduce("test.4", sarama.StringEncoder("5"), sarama.StringEncoder(strconv.Itoa(i)), nil)
+		p.AsyncProduce("test.4", sarama.StringEncoder("1"), sarama.StringEncoder(strconv.Itoa(i)), nil, nil)
+		p.AsyncProduce("test.4", sarama.StringEncoder("2"), sarama.StringEncoder(strconv.Itoa(i)), nil, nil)
+		p.AsyncProduce("test.4", sarama.StringEncoder("3"), sarama.StringEncoder(strconv.Itoa(i)), nil, nil)
+		p.AsyncProduce("test.4", sarama.StringEncoder("4"), sarama.StringEncoder(strconv.Itoa(i)), nil, nil)
+		p.AsyncProduce("test.4", sarama.StringEncoder("5"), sarama.StringEncoder(strconv.Itoa(i)), nil, nil)
 	}
 	p.Stop()
 	offsetsAfter := s.kh.GetNewestOffsets("test.4")
@@ -141,7 +141,7 @@ func (s *ProducerSuite) TestAsyncProduceNilKey(c *C) {
 
 	// When
 	for i := 0; i < 100; i++ {
-		p.AsyncProduce("test.4", nil, sarama.StringEncoder(strconv.Itoa(i)), nil)
+		p.AsyncProduce("test.4", nil, sarama.StringEncoder(strconv.Itoa(i)), nil, nil)
 	}
 	p.Stop()
 	offsetsAfter := s.kh.GetNewestOffsets("test.4")
@@ -167,7 +167,7 @@ func (s *ProducerSuite) TestTooSmallShutdownTimeout(c *C) {
 	// When
 	for i := 0; i < 100; i++ {
 		v := sarama.StringEncoder(strconv.Itoa(i))
-		p.AsyncProduce("test.4", v, v, nil)
+		p.AsyncProduce("test.4", v, v, nil, nil)
 	}
 	p.Stop()
 	offsetsAfter := s.kh.GetNewestOffsets("test.4")
@@ -190,7 +190,7 @@ func (s *ProducerSuite) TestAsyncProduceEmptyKey(c *C) {
 
 	// When
 	for i := 0; i < 10; i++ {
-		p.AsyncProduce("test.4", sarama.StringEncoder(""), sarama.StringEncoder(strconv.Itoa(i)), nil)
+		p.AsyncProduce("test.4", sarama.StringEncoder(""), sarama.StringEncoder(strconv.Itoa(i)), nil, nil)
 	}
 	p.Stop()
 	offsetsAfter := s.kh.GetNewestOffsets("test.4")

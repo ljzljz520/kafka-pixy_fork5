@@ -1,13 +1,16 @@
 package httpsrv
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"runtime"
@@ -182,7 +185,19 @@ func (s *T) getProxy(r *http.Request) (*proxy.T, error) {
 	return s.proxySet.Get(cluster)
 }
 
-// handleProduce is an HTTP request handler for `POST /topic/{topic}/messages`
+// handleProduce is an HTTP request handler for `POST /topic/{topic}/messages`.
+//
+// The handler implements a byte-metered admission contract:
+//  1. Query parameters and X-Kafka headers are validated without touching the
+//     request body.
+//  2. A staging slot is taken and the byte weight (key + declared value +
+//     decoded headers + record framing, with the duplication margin) is
+//     reserved in the proxy before the body is read.
+//  3. The body is read through http.MaxBytesReader, so an oversized or
+//     maliciously slow client can never buffer more than the admitted bytes.
+//  4. On success ownership of the reservation is transferred to the producer;
+//     it is released only when the message gets a final broker
+//     acknowledgement, a terminal failure, or the producer shuts down.
 func (s *T) handleProduce(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
@@ -192,30 +207,227 @@ func (s *T) handleProduce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	topic := mux.Vars(r)[prmTopic]
-	key := getParamBytes(r, prmKey)
-	_, isSync := r.Form[prmSync]
 
-	// Get the message body from the HTTP request.
-	var msg sarama.Encoder
-	if msg, err = s.readMsg(r); err != nil {
+	// Parse query parameters; r.URL.Query() does not read the request body,
+	// unlike r.ParseForm()/r.FormValue().
+	query := r.URL.Query()
+	key := queryParamBytes(query, prmKey)
+	_, isSync := query[prmSync]
+	contentType := r.Header.Get(hdrContentType)
+
+	if !isSupportedProduceContentType(contentType) {
+		s.respondWithJSON(w, http.StatusBadRequest,
+			errorRs{fmt.Sprintf("unsupported content type %s", contentType)})
+		return
+	}
+
+	// Raw (text/json) requests must declare an exact Content-Length; this
+	// allows reserving the exact weight before reading any body byte.
+	declaredLen := int(r.ContentLength)
+	if isRawProduceContentType(contentType) {
+		messageSizeStr, ok := r.Header[hdrContentLength]
+		if !ok {
+			s.respondWithJSON(w, http.StatusBadRequest,
+				errorRs{fmt.Sprintf("missing %s header", hdrContentLength)})
+			return
+		}
+		declaredLen, err = strconv.Atoi(messageSizeStr[0])
+		if err != nil {
+			s.respondWithJSON(w, http.StatusBadRequest,
+				errorRs{fmt.Sprintf("invalid %s header: %s", hdrContentLength, messageSizeStr[0])})
+			return
+		}
+		if declaredLen < 0 {
+			s.respondWithJSON(w, http.StatusBadRequest,
+				errorRs{fmt.Sprintf("invalid %s header: %s", hdrContentLength, messageSizeStr[0])})
+			return
+		}
+	}
+
+	// Bound the number of requests that may hold parsed/staged bytes (decoded
+	// headers, reserved worst-case values) before acquiring a formal byte
+	// reservation. The slot is released as soon as admission completes; the
+	// byte reservation itself covers the bounded body read and the pipeline.
+	if !s.proxySet.TryAcquireProduceSlot() {
+		s.respondWithJSON(w, http.StatusTooManyRequests,
+			errorRs{"too many concurrent produce requests"})
+		return
+	}
+
+	// Decode X-Kafka headers before admission, so header bytes are billed and
+	// malformed values are rejected without reserving anything.
+	headers, err := decodeKafkaHeaders(r.Header)
+	if err != nil {
+		s.proxySet.ReleaseProduceSlot()
 		s.respondWithJSON(w, http.StatusBadRequest, errorRs{err.Error()})
 		return
 	}
 
-	// Look for headers with the "X-Kafka" prefix
+	// For raw bodies the declared Content-Length is exactly the value size.
+	// For urlencoded bodies Content-Length is the wire size (percent encoding
+	// may inflate every value byte up to 3x), so the decoded value length is
+	// unknown at this point and the worst case is reserved, then shrunk once
+	// the form is parsed.
+	spec := proxy.PayloadSpec{
+		KeyLength:   len(key),
+		ValueLength: -1,
+		Headers:     headers,
+	}
+	if isRawProduceContentType(contentType) {
+		spec.ValueLength = declaredLen
+	}
+	admission, err := pxy.AdmitProduce(spec)
+	s.proxySet.ReleaseProduceSlot()
+	if err != nil {
+		s.respondWithJSON(w, produceErrorStatus(err), errorRs{err.Error()})
+		return
+	}
+	submitted := false
+	defer func() {
+		if !submitted {
+			admission.Release()
+		}
+	}()
+
+	// Bounded read happens with the reservation already held. Raw bodies are
+	// capped at one byte past the admitted value. Urlencoded bodies may
+	// percent-encode every byte (up to 3 wire bytes per value byte) plus the
+	// field name and a small fixed margin; a declared Content-Length, when
+	// present, tightens the cap further. That wire expansion is a bounded
+	// transport buffer margin and is returned via Shrink once the value is
+	// parsed.
+	maxValueLen := int64(admission.MaxValueLength())
+	var readLimit int64
+	if isRawProduceContentType(contentType) {
+		readLimit = maxValueLen + 1
+	} else {
+		readLimit = 3*maxValueLen + formBodyOverhead + 1
+		if declaredLen >= 0 && int64(declaredLen)+1 < readLimit {
+			readLimit = int64(declaredLen) + 1
+		}
+	}
+	body, err := s.readProduceBody(w, r, readLimit)
+	if err != nil {
+		if errors.Cause(err) == errBodyTooLarge {
+			s.respondWithJSON(w, http.StatusRequestEntityTooLarge, errorRs{err.Error()})
+			return
+		}
+		s.respondWithJSON(w, http.StatusBadRequest, errorRs{err.Error()})
+		return
+	}
+
+	var value sarama.Encoder
+	if isRawProduceContentType(contentType) {
+		if len(body) != declaredLen {
+			s.respondWithJSON(w, http.StatusBadRequest, errorRs{
+				fmt.Sprintf("message size does not match %s: expected=%v, actual=%v",
+					hdrContentLength, declaredLen, len(body))})
+			return
+		}
+		if err := admission.CommitValue(len(body)); err != nil {
+			s.respondWithJSON(w, produceErrorStatus(err), errorRs{err.Error()})
+			return
+		}
+		value = sarama.ByteEncoder(body)
+	} else {
+		// Parse the urlencoded form from the already bounded body bytes.
+		r.Body = ioutil.NopCloser(bytes.NewReader(body))
+		if err := r.ParseForm(); err != nil {
+			s.respondWithJSON(w, http.StatusBadRequest, errorRs{err.Error()})
+			return
+		}
+		msg := r.FormValue("msg")
+		if msg == "" {
+			s.respondWithJSON(w, http.StatusBadRequest, errorRs{"empty message"})
+			return
+		}
+		if err := admission.CommitValue(len(msg)); err != nil {
+			s.respondWithJSON(w, produceErrorStatus(err), errorRs{err.Error()})
+			return
+		}
+		value = sarama.StringEncoder(msg)
+	}
+
+	// Asynchronously submit the message to the Kafka cluster. A nil error
+	// only means that the request was admitted and entered the pipeline.
+	if !isSync {
+		if err = pxy.AsyncProduce(admission, topic, toEncoderPreservingNil(key), value, headers); err != nil {
+			s.respondWithJSON(w, produceErrorStatus(err), errorRs{err.Error()})
+			return
+		}
+		submitted = true
+		s.respondWithJSON(w, http.StatusOK, EmptyResponse)
+		return
+	}
+
+	prodMsg, err := pxy.Produce(admission, topic, toEncoderPreservingNil(key), value, headers)
+	if err != nil {
+		s.respondWithJSON(w, produceSyncErrorStatus(err), errorRs{err.Error()})
+		return
+	}
+	submitted = true
+	s.respondWithJSON(w, http.StatusOK, produceRs{
+		Partition: prodMsg.Partition,
+		Offset:    prodMsg.Offset,
+	})
+}
+
+// errBodyTooLarge is returned when a bounded produce body read exceeds the
+// admitted size.
+var errBodyTooLarge = errors.New("message body is too large")
+
+// formBodyOverhead bounds the non-value wire bytes of an urlencoded produce
+// request: the "msg=" field name, delimiters and a small margin for any
+// additional field.
+const formBodyOverhead = 64
+
+// readProduceBody reads the request body bounded by `limit` bytes. It never
+// buffers more than the limit and returns errBodyTooLarge when the body is
+// larger.
+func (s *T) readProduceBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	if err != nil {
+		if isRequestBodyTooLarge(err) {
+			return nil, errBodyTooLarge
+		}
+		return nil, errors.Wrap(err, "failed to read message")
+	}
+	return body, nil
+}
+
+// isRequestBodyTooLarge recognizes the error of http.MaxBytesReader. Since
+// Go 1.19 it is the exported *http.MaxBytesError; on earlier toolchains it
+// is an unexported error carrying the same stable message.
+func isRequestBodyTooLarge(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "http: request body too large")
+}
+
+// isSupportedProduceContentType reports whether the content type can carry a
+// produce request.
+func isSupportedProduceContentType(contentType string) bool {
+	return isRawProduceContentType(contentType) ||
+		contentType == "application/x-www-form-urlencoded"
+}
+
+// isRawProduceContentType reports whether the body bytes are the message
+// value verbatim (text/plain and JSON variants).
+func isRawProduceContentType(contentType string) bool {
+	return contentType == "text/plain" || jsonContentTypePattern.MatchString(contentType)
+}
+
+// decodeKafkaHeaders extracts Kafka record headers from X-Kafka-* HTTP
+// headers; header values must be standard base64 encoded.
+func decodeKafkaHeaders(header http.Header) ([]sarama.RecordHeader, error) {
 	var headers []sarama.RecordHeader
-	for header, values := range r.Header {
-		if !strings.HasPrefix(header, hdrKafkaPrefix) {
+	for headerName, values := range header {
+		if !strings.HasPrefix(headerName, hdrKafkaPrefix) {
 			continue
 		}
-
-		headerBytes := []byte(header[len(hdrKafkaPrefix):])
+		headerBytes := []byte(headerName[len(hdrKafkaPrefix):])
 		for _, v := range values {
 			decoded, err := base64.StdEncoding.DecodeString(v)
 			if err != nil {
-				errorText := fmt.Sprintf("Invalid base64 encoding for header: %s", header)
-				s.respondWithJSON(w, http.StatusBadRequest, errorRs{errorText})
-				return
+				return nil, errors.Errorf("Invalid base64 encoding for header: %s", headerName)
 			}
 			headers = append(headers, sarama.RecordHeader{
 				Key:   headerBytes,
@@ -223,69 +435,32 @@ func (s *T) handleProduce(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-
-	// Asynchronously submit the message to the Kafka cluster.
-	if !isSync {
-		pxy.AsyncProduce(topic, toEncoderPreservingNil(key), msg, headers)
-		s.respondWithJSON(w, http.StatusOK, EmptyResponse)
-		return
-	}
-
-	prodMsg, err := pxy.Produce(topic, toEncoderPreservingNil(key), msg, headers)
-	if err != nil {
-		var status int
-		switch err {
-		case sarama.ErrUnknownTopicOrPartition:
-			status = http.StatusNotFound
-		case proxy.ErrDisabled:
-			fallthrough
-		case proxy.ErrUnavailable:
-			status = http.StatusServiceUnavailable
-		case proxy.ErrHeadersUnsupported:
-			status = http.StatusBadRequest
-		default:
-			status = http.StatusInternalServerError
-		}
-		s.respondWithJSON(w, status, errorRs{err.Error()})
-		return
-	}
-
-	s.respondWithJSON(w, http.StatusOK, produceRs{
-		Partition: prodMsg.Partition,
-		Offset:    prodMsg.Offset,
-	})
+	return headers, nil
 }
 
-// readMsg reads message from the HTTP request based on the Content-Type header.
-func (s *T) readMsg(r *http.Request) (sarama.Encoder, error) {
-	contentType := r.Header.Get(hdrContentType)
-	if contentType == "text/plain" || jsonContentTypePattern.MatchString(contentType) {
-		if _, ok := r.Header[hdrContentLength]; !ok {
-			return nil, errors.Errorf("missing %s header", hdrContentLength)
-		}
-		messageSizeStr := r.Header.Get(hdrContentLength)
-		msgSize, err := strconv.Atoi(messageSizeStr)
-		if err != nil {
-			return nil, errors.Errorf("invalid %s header: %s", hdrContentLength, messageSizeStr)
-		}
-		msg, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to read message")
-		}
-		if len(msg) != msgSize {
-			return nil, errors.Errorf("message size does not match %s: expected=%v, actual=%v",
-				hdrContentLength, msgSize, len(msg))
-		}
-		return sarama.ByteEncoder(msg), nil
+// produceErrorStatus maps pre-enqueue admission errors to HTTP status codes.
+func produceErrorStatus(err error) int {
+	switch err {
+	case proxy.ErrMessageTooLarge:
+		return http.StatusRequestEntityTooLarge
+	case proxy.ErrQuotaExhausted:
+		return http.StatusTooManyRequests
+	case proxy.ErrHeadersUnsupported:
+		return http.StatusBadRequest
+	case proxy.ErrDisabled, proxy.ErrUnavailable:
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
 	}
-	if contentType == "application/x-www-form-urlencoded" {
-		msg := r.FormValue("msg")
-		if msg == "" {
-			return nil, errors.Errorf("empty message")
-		}
-		return sarama.StringEncoder(msg), nil
+}
+
+// produceSyncErrorStatus maps synchronous produce errors to HTTP status
+// codes, preserving the existing post-enqueue error mapping.
+func produceSyncErrorStatus(err error) int {
+	if err == sarama.ErrUnknownTopicOrPartition {
+		return http.StatusNotFound
 	}
-	return nil, errors.Errorf("unsupported content type %s", contentType)
+	return produceErrorStatus(err)
 }
 
 // handleConsume is an HTTP request handler for `GET /topic/{topic}/messages`
@@ -671,16 +846,15 @@ type topicMetadata struct {
 	Partitions []partitionMetadata `json:"partitions,omitempty"`
 }
 
-// getParamBytes returns the request parameter s a slice of bytes. It works
-// pretty much the same way s `http.FormValue`, except it distinguishes empty
-// value (`[]byte{}`) from missing one (`nil`).
-func getParamBytes(r *http.Request, name string) []byte {
-	r.ParseForm() // Ignore errors, the go library does the same in FormValue.
-	values, ok := r.Form[name]
-	if !ok || len(values) == 0 {
+// queryParamBytes returns a URL query parameter as a slice of bytes. Unlike
+// `http.FormValue` it never parses the request body, and it distinguishes an
+// empty value (`[]byte{}`) from a missing one (`nil`).
+func queryParamBytes(values url.Values, name string) []byte {
+	v, ok := values[name]
+	if !ok || len(v) == 0 {
 		return nil
 	}
-	return []byte(values[0])
+	return []byte(v[0])
 }
 
 // respondWithJSON marshals `body` to a JSON string and sends it s an HTTP

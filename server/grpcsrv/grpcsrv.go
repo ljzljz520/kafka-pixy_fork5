@@ -82,10 +82,24 @@ func (s *T) Stop() {
 }
 
 // Produce implements pb.KafkaPixyServer
+//
+// The 1MiB gRPC receive size limit (see New) bounds the decoded request a
+// client can make us stage. On top of that a staging slot bounds how many
+// decoded requests may wait for a formal byte reservation, and AdmitProduce
+// reserves the billable weight (key, value, decoded headers, record framing
+// with the duplication margin) before the message enters the producer
+// pipeline. The slot is released as soon as the reservation is granted; the
+// byte reservation then covers the message until its terminal broker state.
 func (s *T) Produce(ctx context.Context, req *pb.ProdRq) (*pb.ProdRs, error) {
 	pxy, err := s.proxySet.Get(req.Cluster)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, err.Error())
+	}
+
+	// Cap the number of requests holding a decoded payload while waiting for
+	// a formal byte reservation.
+	if !s.proxySet.TryAcquireProduceSlot() {
+		return nil, status.Errorf(codes.ResourceExhausted, "too many concurrent produce requests")
 	}
 
 	var headers []sarama.RecordHeader
@@ -102,12 +116,30 @@ func (s *T) Produce(ctx context.Context, req *pb.ProdRq) (*pb.ProdRs, error) {
 		}
 	}
 
+	keyLength := 0
+	if !req.KeyUndefined {
+		keyLength = len(req.KeyValue)
+	}
+	admission, err := pxy.AdmitProduce(proxy.PayloadSpec{
+		KeyLength:   keyLength,
+		ValueLength: len(req.Message),
+		Headers:     headers,
+	})
+	s.proxySet.ReleaseProduceSlot()
+	if err != nil {
+		return nil, produceAdmissionStatus(err)
+	}
+
 	if req.AsyncMode {
-		pxy.AsyncProduce(req.Topic, keyEncoderFor(req), sarama.StringEncoder(req.Message), headers)
+		// A nil error only means that budget was acquired and the message
+		// entered the proxy pipeline; it does not promise the broker write.
+		if err := pxy.AsyncProduce(admission, req.Topic, keyEncoderFor(req), sarama.StringEncoder(req.Message), headers); err != nil {
+			return nil, produceAdmissionStatus(err)
+		}
 		return &pb.ProdRs{Partition: -1, Offset: -1}, nil
 	}
 
-	prodMsg, err := pxy.Produce(req.Topic, keyEncoderFor(req), sarama.StringEncoder(req.Message), headers)
+	prodMsg, err := pxy.Produce(admission, req.Topic, keyEncoderFor(req), sarama.StringEncoder(req.Message), headers)
 	if err != nil {
 		switch err {
 		case sarama.ErrUnknownTopicOrPartition:
@@ -118,11 +150,34 @@ func (s *T) Produce(ctx context.Context, req *pb.ProdRq) (*pb.ProdRs, error) {
 			return nil, status.Errorf(codes.Unavailable, err.Error())
 		case proxy.ErrHeadersUnsupported:
 			return nil, status.Errorf(codes.InvalidArgument, err.Error())
+		case proxy.ErrQuotaExhausted:
+			return nil, status.Errorf(codes.ResourceExhausted, err.Error())
+		case proxy.ErrMessageTooLarge:
+			return nil, status.Errorf(codes.InvalidArgument, err.Error())
 		default:
 			return nil, status.Errorf(codes.Internal, err.Error())
 		}
 	}
 	return &pb.ProdRs{Partition: prodMsg.Partition, Offset: prodMsg.Offset}, nil
+}
+
+// produceAdmissionStatus maps pre-enqueue admission errors to gRPC status
+// codes. Insufficient byte budget is overload (ResourceExhausted); a record
+// beyond max.message.bytes, unsupported headers and bad arguments are
+// InvalidArgument; a stopping proxy is Unavailable.
+func produceAdmissionStatus(err error) error {
+	switch err {
+	case proxy.ErrQuotaExhausted:
+		return status.Errorf(codes.ResourceExhausted, err.Error())
+	case proxy.ErrMessageTooLarge:
+		return status.Errorf(codes.InvalidArgument, err.Error())
+	case proxy.ErrHeadersUnsupported:
+		return status.Errorf(codes.InvalidArgument, err.Error())
+	case proxy.ErrDisabled, proxy.ErrUnavailable:
+		return status.Errorf(codes.Unavailable, err.Error())
+	default:
+		return status.Errorf(codes.Internal, err.Error())
+	}
 }
 
 // ConsumeNAck implements pb.KafkaPixyServer

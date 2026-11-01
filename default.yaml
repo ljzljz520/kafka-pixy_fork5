@@ -90,6 +90,17 @@ proxies:
       # set equal to or smaller than the broker's `message.max.bytes`.
       max_message_bytes: 1000000
 
+      # Per-cluster byte budget for produce payload held by the process while a
+      # message is in flight (admitted but not yet acknowledged by the broker).
+      # The accounted weight covers the message key, value, decoded Kafka
+      # headers and record framing, multiplied by
+      # `produce_budget.duplication_factor`. Leave it commented out to use the
+      # application-wide default `produce_budget.per_cluster_bytes`. This
+      # cluster limit is independent of the other clusters' limits, so a slow
+      # or unavailable cluster cannot consume the admission quota of the
+      # others.
+      # budget_bytes: 67108864
+
       # The type of compression to use on messages. Allowed values are:
       # none, gzip, snappy, and lz4.
       compression: snappy
@@ -202,6 +213,50 @@ tls:
   # Path to the server certificate key file.
   # Required if using gRPC SSL/TLS or HTTPS.
   # key_path: /usr/local/etc/server.key
+
+# Byte-metered admission control for produce requests. Before an HTTP or
+# gRPC produce request is accepted its billable weight (message key, value,
+# decoded Kafka headers and fixed record framing, multiplied by
+# `duplication_factor`) is reserved in both the process-global budget below
+# and the budget of the target cluster. The reservation is held while the
+# message travels through the handler, the dispatcher channels and sarama's
+# in-flight state, and is released only after the final broker
+# acknowledgement, a terminal failure, or a shutdown. When there is no room
+# left the request is rejected immediately with HTTP 429 / gRPC
+# ResourceExhausted, instead of buffering it; a record larger than
+# producer.max_message_bytes is rejected before its body is read (HTTP 413).
+#
+# Note that these numbers bound the produce payload proxied on behalf of
+# clients plus the bounded transport read buffers (HTTP bodies are read
+# through a capped reader; gRPC reception is capped at 1MiB); they are NOT a
+# precise cap on the Go process heap, since sarama, compression, the Go
+# runtime and the transport layers allocate additional memory on top of the
+# accounted payload.
+produce_budget:
+
+  # Total accounted produce weight allowed in the process, shared by all
+  # configured clusters. 134217728 = 128 MiB.
+  total_bytes: 134217728
+
+  # Default per-cluster accounted produce weight. 67108864 = 64 MiB. A
+  # particular cluster can override it with its producer `budget_bytes`.
+  # Because each cluster has its own limit, one slow or unavailable cluster
+  # cannot exhaust the admission quota of the others as long as its limit is
+  # below the process total.
+  per_cluster_bytes: 67108864
+
+  # Multiplier applied to every accounted payload to cover the copies of the
+  # same bytes retained concurrently at the several pipeline stages (request
+  # handler, dispatcher channel, sarama in-flight/request encoding). Allowed
+  # values are 1 to 8.
+  duplication_factor: 2
+
+  # Maximum number of produce requests that may be parsed and staged
+  # concurrently before acquiring a formal byte reservation (HTTP bodies are
+  # read with a reservation already held; for gRPC this bounds decoded
+  # requests awaiting admission). Requests above the cap fail fast with HTTP
+  # 429 / gRPC ResourceExhausted.
+  max_concurrent_requests: 512
 
 # A list of defined loggers, multiple loggers are allowed and each log line will be sent to every logger defined.
 logging:

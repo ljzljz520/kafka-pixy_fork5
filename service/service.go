@@ -38,7 +38,7 @@ func Spawn(cfg *config.App) (*T, error) {
 		s.proxies[cluster] = pxy
 	}
 
-	proxySet := proxy.NewSet(s.proxies, s.proxies[cfg.DefaultCluster])
+	proxySet := proxy.NewSet(cfg, s.proxies, s.proxies[cfg.DefaultCluster])
 
 	if cfg.GRPCAddr != "" {
 		securityOpts, err := cfg.GRPCSecurityOpts()

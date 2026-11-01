@@ -376,9 +376,10 @@ func (s *ServiceHTTPSuite) TestLargestMessage(c *C) {
 	c.Check(readMsg, Equals, msg)
 }
 
-// Messages that are larger then producer's MaxMessageBytes size are silently
-// dropped. Note that we assume that the broker's limit is the same as the
-// producer's one or higher.
+// Messages that are larger then producer's MaxMessageBytes size are rejected
+// at admission time, before the body is enqueued: the client gets HTTP 413
+// and nothing is written to Kafka. Note that we assume that the broker's
+// limit is the same as the producer's one or higher.
 func (s *ServiceHTTPSuite) TestMessageTooLarge(c *C) {
 	offsetsBefore := s.kh.GetNewestOffsets("test.4")
 	maxMsgSize := sarama.NewConfig().Producer.MaxMessageBytes - ProdMsgMetadataSize([]byte("foo")) + 1
@@ -392,8 +393,10 @@ func (s *ServiceHTTPSuite) TestMessageTooLarge(c *C) {
 	svc.Stop() // Have to stop before getOffsets
 
 	// Then
-	c.Check(r.StatusCode, Equals, http.StatusOK)
-	c.Check(ParseJSONBody(c, r), DeepEquals, map[string]interface{}{})
+	c.Check(r.StatusCode, Equals, http.StatusRequestEntityTooLarge)
+	body, err := ioutil.ReadAll(r.Body)
+	c.Assert(err, IsNil)
+	c.Check(string(body), Matches, "(?s).*message is too large.*")
 	offsetsAfter := s.kh.GetNewestOffsets("test.4")
 	c.Check(offsetsAfter, DeepEquals, offsetsBefore)
 }

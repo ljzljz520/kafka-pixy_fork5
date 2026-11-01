@@ -7,6 +7,7 @@ import (
 	"github.com/Shopify/sarama"
 	"github.com/mailgun/kafka-pixy/actor"
 	"github.com/mailgun/kafka-pixy/admin"
+	"github.com/mailgun/kafka-pixy/budget"
 	"github.com/mailgun/kafka-pixy/config"
 	"github.com/mailgun/kafka-pixy/consumer"
 	"github.com/mailgun/kafka-pixy/consumer/consumerimpl"
@@ -18,12 +19,28 @@ import (
 
 const (
 	initEventsChMapCapacity = 256
+
+	// recordFramingOverhead estimates the fixed per-record Kafka wire
+	// overhead (CRC, flags, timestamp, lengths, ...). It mirrors the
+	// accounting historically used to derive the admittable value size from
+	// producer.max_message_bytes.
+	recordFramingOverhead = 26
+	// recordHeaderOverhead estimates the per-header length prefixes on top of
+	// the header key and value bytes.
+	recordHeaderOverhead = 4
 )
 
 var (
 	ErrUnavailable        = errors.New("service is shutting down")
 	ErrDisabled           = errors.New("service is disabled by configuration")
 	ErrHeadersUnsupported = errors.New("headers are not supported with this version of Kafka. Consider changing `kafka.version` (https://github.com/mailgun/kafka-pixy/blob/master/default.yaml#L35)")
+	// ErrMessageTooLarge is returned before the payload is read/enqueued when
+	// it exceeds producer.max_message_bytes.
+	ErrMessageTooLarge = errors.New("message is too large")
+	// ErrQuotaExhausted is returned at admission time when the produce byte
+	// budget has no room for the request. Callers map it to HTTP 429 / gRPC
+	// ResourceExhausted.
+	ErrQuotaExhausted = budget.ErrQuotaExhausted
 
 	noAck   = Ack{partition: -1}
 	autoAck = Ack{partition: -2}
@@ -41,6 +58,10 @@ type T struct {
 
 	producerMu sync.RWMutex
 	producer   *producer.T
+
+	// lane pairs the process-global produce byte limiter with the per-cluster
+	// one; it is attached by Set.NewSet once all proxies are spawned.
+	lane budget.Lane
 
 	consumerMu sync.RWMutex
 	consumer   consumer.T
@@ -170,45 +191,164 @@ func (p *T) stopAdmin() {
 	p.adminMu.Unlock()
 }
 
-// Produce submits a message to the specified `topic` of the Kafka cluster
-// using `key` to identify a destination partition. The exact algorithm used to
-// map keys to partitions is implementation specific but it is guaranteed that
-// it returns consistent results. If `key` is `nil`, then the message is placed
-// into a random partition.
-//
-// Errors usually indicate a catastrophic failure of the Kafka cluster, or
-// missing topic if there cluster is not configured to auto create topics.
-func (p *T) Produce(topic string, key, message sarama.Encoder, headers []sarama.RecordHeader) (*sarama.ProducerMessage, error) {
-	if len(headers) > 0 && !p.cfg.Kafka.Version.IsAtLeast(sarama.V0_11_0_0) {
+// PayloadSpec describes the billable parts of a produce request at
+// admission time, before (or independently from) reading the message body.
+// Billing explicitly covers the key, the value, the decoded Kafka headers
+// and fixed record framing — it is never derived from Content-Length alone.
+type PayloadSpec struct {
+	// KeyLength is the number of bytes of the message key (0 for no key).
+	KeyLength int
+	// ValueLength is the declared value size in bytes. A negative value
+	// means the length is not known yet (chunked HTTP upload); the maximum
+	// admittable value size is reserved until the actual length is committed.
+	ValueLength int
+	// Headers are the decoded Kafka record headers; both key and value bytes
+	// are accounted.
+	Headers []sarama.RecordHeader
+}
+
+// Admission is a byte budget reservation granted for one produce request.
+// Ownership flows from the request handler to the producer dispatcher, which
+// releases it when the message gets a final broker acknowledgement, a
+// terminal failure, or the producer is stopped. If the request fails before
+// being submitted (bad body, oversize, etc.) the caller must Release it.
+type Admission struct {
+	p *T
+
+	reservation *budget.Reservation
+	// fixedBytes is the accounted weight components other than the value:
+	// key, headers and record framing, after the duplication factor.
+	fixedWeight int64
+	// valueReserved is the value length the reservation was created with.
+	valueReserved int
+	// valueLimit is the maximum admittable value length for this request.
+	valueLimit int
+}
+
+// AdmitProduce performs all pre-enqueue checks and, when they pass, reserves
+// the byte weight of the request in both the process-global and the
+// per-cluster produce budgets. It does not block: a lack of quota is
+// reported as ErrQuotaExhausted so callers can return HTTP 429 / gRPC
+// ResourceExhausted.
+func (p *T) AdmitProduce(spec PayloadSpec) (*Admission, error) {
+	p.producerMu.RLock()
+	stopped := p.producer == nil
+	p.producerMu.RUnlock()
+	if stopped {
+		return nil, ErrUnavailable
+	}
+
+	if len(spec.Headers) > 0 && !p.cfg.Kafka.Version.IsAtLeast(sarama.V0_11_0_0) {
 		return nil, ErrHeadersUnsupported
 	}
 
-	p.producerMu.RLock()
-	if p.producer == nil {
-		p.producerMu.RUnlock()
+	headersLen := 0
+	for _, h := range spec.Headers {
+		headersLen += len(h.Key) + len(h.Value)
+	}
+	overhead := recordFramingOverhead + len(spec.Headers)*recordHeaderOverhead
+	valueLimit := p.cfg.Producer.MaxMessageBytes - overhead - spec.KeyLength - headersLen
+	if valueLimit < 0 {
+		return nil, ErrMessageTooLarge
+	}
+
+	declared := spec.ValueLength
+	if declared < 0 {
+		// Unknown declared length (chunked transfer): reserve the worst case
+		// and shrink the reservation once the actual size is known.
+		declared = valueLimit
+	}
+	if declared > valueLimit {
+		return nil, ErrMessageTooLarge
+	}
+
+	payloadBytes := int64(overhead + spec.KeyLength + headersLen + declared)
+	weight := p.lane.Weight(payloadBytes)
+	reservation, err := p.lane.TryAcquire(weight)
+	if err != nil {
+		return nil, ErrQuotaExhausted
+	}
+	return &Admission{
+		p:             p,
+		reservation:   reservation,
+		fixedWeight:   p.lane.Weight(int64(overhead + spec.KeyLength + headersLen)),
+		valueReserved: declared,
+		valueLimit:    valueLimit,
+	}, nil
+}
+
+// MaxValueLength is the maximum number of value bytes allowed for this
+// admitted request; HTTP handlers use it to cap the bounded body read.
+func (a *Admission) MaxValueLength() int {
+	return a.valueLimit
+}
+
+// CommitValue reconciles the reservation with the actual value size. It
+// rejects oversize values and returns any over-reserved bytes (unknown
+// declared length or form-encoded bodies). The returned error, if any, has
+// already released the admission.
+func (a *Admission) CommitValue(actualLength int) error {
+	if actualLength > a.valueLimit {
+		a.Release()
+		return ErrMessageTooLarge
+	}
+	if actualLength < a.valueReserved {
+		a.reservation.Shrink(a.fixedWeight + a.p.lane.Weight(int64(actualLength)))
+		a.valueReserved = actualLength
+	}
+	return nil
+}
+
+// Release returns the reserved bytes. It is idempotent and must be called by
+// the admitting request when submission never happens; after a successful
+// submission the producer dispatcher owns the reservation.
+func (a *Admission) Release() {
+	a.reservation.Release()
+}
+
+// Produce submits an admitted message synchronously. On success the returned
+// ProducerMessage carries the partition and offset assigned by the broker;
+// that partition follows the existing key-partitioning rules. Pre-enqueue
+// failures (shutdown) are returned immediately; post-enqueue failures come
+// from the broker and may be e.g. sarama.ErrUnknownTopicOrPartition.
+func (p *T) Produce(a *Admission, topic string, key, message sarama.Encoder, headers []sarama.RecordHeader) (*sarama.ProducerMessage, error) {
+	responseCh, err := p.submit(a, topic, key, message, headers)
+	if err != nil {
+		return nil, err
+	}
+	rs := <-responseCh
+	if rs.Err == producer.ErrShuttingDown {
 		return nil, ErrUnavailable
 	}
-	responseCh := p.producer.AsyncProduce(topic, key, message, headers)
-	p.producerMu.RUnlock()
-
-	rs := <-responseCh
 	return rs.Msg, rs.Err
 }
 
-// AsyncProduce is an asynchronously counterpart of the `Produce` function.
-// Errors are silently ignored.
-func (p *T) AsyncProduce(topic string, key, message sarama.Encoder, headers []sarama.RecordHeader) {
-	if len(headers) > 0 && !p.cfg.Kafka.Version.IsAtLeast(sarama.V0_11_0_0) {
-		return
-	}
+// AsyncProduce submits an admitted message asynchronously. A nil return only
+// means that the request holds byte budget and has entered the proxy produce
+// pipeline; it does not promise the eventual broker write.
+func (p *T) AsyncProduce(a *Admission, topic string, key, message sarama.Encoder, headers []sarama.RecordHeader) error {
+	_, err := p.submit(a, topic, key, message, headers)
+	return err
+}
 
+// submit enqueues the admitted message to the producer, transferring budget
+// ownership to the producer dispatcher. The read lock is held across the
+// enqueue so that producer shutdown cannot close the dispatcher channel
+// while the message is being sent.
+func (p *T) submit(a *Admission, topic string, key, message sarama.Encoder, headers []sarama.RecordHeader) (<-chan producer.Response, error) {
 	p.producerMu.RLock()
+	defer p.producerMu.RUnlock()
 	if p.producer == nil {
-		p.producerMu.RUnlock()
-		return
+		a.Release()
+		return nil, ErrUnavailable
 	}
-	p.producer.AsyncProduce(topic, key, message, headers)
-	p.producerMu.RUnlock()
+	return p.producer.AsyncProduce(topic, key, message, headers, a.reservation), nil
+}
+
+// setAdmission attaches the process-global/per-cluster admission lane. It is
+// called by Set while wiring spawned proxies.
+func (p *T) setAdmission(lane budget.Lane) {
+	p.lane = lane
 }
 
 // Consume consumes a message from the specified topic on behalf of the
